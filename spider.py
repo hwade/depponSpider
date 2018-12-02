@@ -9,7 +9,7 @@ from threading import Thread
 
 def request(url, opener=None, data=None, timeout=3, max_try=5):
     if max_try < 0:
-        print('Request exceed max try')
+        #print('Request exceed max try')
         return None
     try:
         if opener is None:
@@ -19,7 +19,7 @@ def request(url, opener=None, data=None, timeout=3, max_try=5):
             ]
         res = opener.open(url, data, timeout=timeout)
         data = res.read()
-        print(res.msg)
+        #print(res.msg)
         return data
     except Exception, e:
         #print('Request Exception: %s' % str(e))
@@ -28,7 +28,12 @@ def request(url, opener=None, data=None, timeout=3, max_try=5):
 def getNation(opener, nation_url, data=None):
     try:
         data = request(nation_url, opener=opener, data=data)
-        print(data)
+        #print(data)
+        while data is None:
+            data = request(nation_url, opener=opener, data=data)
+        data = json.loads(data)['result']
+        print('Nations: \n%s' % str(data))
+        return [d['nationCode'] for d in data]
     except Exception, e:
         print('GetNation Exception: %s' % str(e))
     return None
@@ -114,3 +119,4 @@ if __name__ == '__main__':
     
     ip_list = getProxy(proxy_url)
     valid_openers = getValidProxyOpener(ip_list, os.path.join(base_url, nation_q))
+    nations_code = getNation(valid_openers[0], os.path.join(base_url, nation_q))
