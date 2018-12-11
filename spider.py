@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
+#from __future__ import division
 from gevent import monkey; monkey.patch_all()
 import os
 import time
 import json
+import Queue
 import pickle
 import gevent
 import urllib
@@ -10,7 +12,9 @@ import urllib2
 import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
-from threading import Thread
+from threading import Thread, Lock
+
+MUTEX = Lock()
 
 def request(url, openers=None, data=None, timeout=3, max_try=5):
     if max_try < 0:
@@ -19,20 +23,28 @@ def request(url, openers=None, data=None, timeout=3, max_try=5):
     try:
         opener = None
         if openers is None:
-            opener = urllib2.build_opener()
-            opener.addheaders = [ 
-                ('User-Agent', 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:63.0) Gecko/20100101 Firefox/63.0')
-            ]
+            headers = {'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:63.0) Gecko/20100101 Firefox/63.0'}
+            req = urllib2.Request(url, data=data, headers=headers)
+            res = urllib2.urlopen(req, timeout=timeout)
+            data = res.read()
+            return data
         else:
             opener = np.random.choice(openers)
-        req = urllib2.Request(url, data=data)
-        res = opener.open(req, timeout=timeout)
-        #data = res.read()
-        return res
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:63.0) Gecko/20100101 Firefox/63.0',
+                'Content-Type': 'application/json'
+            }
+            req = urllib2.Request(url, data=data, headers=headers)
+            res = opener.open(req, timeout=timeout)
+            #print(res.msg)
+            data = res.read()
+            return data
     except urllib2.URLError, e:
         return request(url, openers=openers, data=data, timeout=timeout, max_try=max_try-1)
+    except urllib2.HTTPError, e:
+        return request(url, openers=openers, data=data, timeout=timeout, max_try=max_try-1)
     except Exception, e:
-        print('Request Exception: %s' % str(e))
+        #print('Request Exception: %s' % str(e))
         return request(url, openers=openers, data=data, timeout=timeout, max_try=max_try-1)
 
 def geventReqRecurve(openers, urls):
@@ -42,11 +54,14 @@ def geventReqRecurve(openers, urls):
     res = gevent.joinall(gs)
     for j in range(len(gs)):
         d = gs[j].get()
-        if d != None and d.msg == 'OK':
-            data = d.read()
-            lists.extend(json.loads(data)['result'])
-        else:
+        if d is None:
             reget_list.append(urls[j])
+            continue
+        data = json.loads(d)
+        if data['status'] == 'fail':
+            reget_list.append(urls[j])
+        else:
+            lists.extend(data['result'])
     if len(reget_list) > 0:
         lists.extend(geventReqRecurve(openers, reget_list))
     return lists
@@ -58,14 +73,15 @@ def geventReq(openers, urls):
     res = gevent.joinall(gs)
     for j in range(len(gs)):
         d = gs[j].get()
-        if d != None and d.msg == 'OK':
-            data = d.read()
-            lists.extend(json.loads(data)['result'])
-        else:
+        if d is None:
             reget_list.append(urls[j])
+            continue
+        data = json.loads(d)
+        if data['status'] == 'fail': reget_list.append(urls[j])
+        else: lists.extend(data['result'])
     return lists, reget_list
             
-def getNation(openers, nation_url, data=None, to_file='nation.pkl'):
+def getNation(openers, nation_url, data=None, to_file='cache/nation.pkl'):
     try:
         if os.path.exists(to_file): 
             with open(to_file, 'rb') as fp: 
@@ -74,18 +90,18 @@ def getNation(openers, nation_url, data=None, to_file='nation.pkl'):
                 return data
         res = request(nation_url, openers=openers, data=data)
         #print(data)
-        while res is None or res.msg != 'OK':
+        while res is None or json.loads(res)['status'] != 'success':
             res = request(nation_url, openers=openers, data=data)
-        data = json.loads(res.read())['result']
-        #data = [d['nationCode'] for d in data]
-        with open(to_file, 'wb') as fp: pickle.dump(data, fp)
-        print('Nations length: %d' % len(data))
-        return data
+        res = json.loads(res)['result']
+        #res = [d['nationCode'] for d in res]
+        with open(to_file, 'wb') as fp: pickle.dump(res, fp)
+        print('Nations length: %d' % len(res))
+        return res
     except Exception, e:
         print('GetNation Exception: %s' % str(e))
     return None
 
-def getHMT(openers, hmt_url, data=None, to_file='hmt.pkl'):
+def getHMT(openers, hmt_url, data=None, to_file='cache/hmt.pkl'):
     try:
         if os.path.exists(to_file): 
             with open(to_file, 'rb') as fp: 
@@ -96,7 +112,7 @@ def getHMT(openers, hmt_url, data=None, to_file='hmt.pkl'):
         #print(data)
         while res is None or res.msg != 'OK':
             res = request(hmt_url, openers=openers, data=data)
-        data = json.loads(res.read())['result']
+        data = validData(res)
         #data = [d['nationCode'] for d in data]
         with open(to_file, 'wb') as fp: pickle.dump(data, fp)
         print('HMT length: %d' % len(data))
@@ -105,7 +121,7 @@ def getHMT(openers, hmt_url, data=None, to_file='hmt.pkl'):
         print('GetHMT Exception: %s' % str(e))
     return None
     
-def getProvince(openers, nations_code, province_url, max_num=50, to_file='province.pkl'):
+def getProvince(openers, nations_code, province_url, max_num=50, to_file='cache/province.pkl'):
     try:
         if os.path.exists(to_file): 
             with open(to_file, 'rb') as fp: 
@@ -127,7 +143,7 @@ def getProvince(openers, nations_code, province_url, max_num=50, to_file='provin
         print('GetProvince Exception: %s' % str(e))
     return None
     
-def getCity(openers, provinces_code, city_url, max_num=50, to_file='city.pkl'):
+def getCity(openers, provinces_code, city_url, max_num=50, to_file='cache/city.pkl'):
     try:
         if os.path.exists(to_file): 
             with open(to_file, 'rb') as fp: 
@@ -149,7 +165,7 @@ def getCity(openers, provinces_code, city_url, max_num=50, to_file='city.pkl'):
         print('GetCities Exception: %s' % str(e))
     return None
     
-def getCounty(openers, cities_code, county_url, max_num=50, to_file='county.pkl'):
+def getCounty(openers, cities_code, county_url, max_num=50, to_file='cache/county.pkl'):
     try:
         if os.path.exists(to_file): 
             with open(to_file, 'rb') as fp: 
@@ -167,8 +183,6 @@ def getCounty(openers, cities_code, county_url, max_num=50, to_file='county.pkl'
             counties.extend(cs)
             reget_list.extend(rl)
             i = i + 1
-        print(len(counties))
-        print(len(reget_list))
         while len(reget_list) > 0:
             l = len(reget_list)
             url_batch = [reget_list.pop() for _ in range(min(l, max_num))]
@@ -186,14 +200,16 @@ def getProxy(proxy_url, num=5):
         ip_list = []
         for i in range(1, num+1):
             print('getting proxy page %d' % i)
-            data = request(proxy_url + str(i)).read().decode('utf-8')
+            data = request(proxy_url + str(i))
+            if data == None: continue
+            data = data.decode('utf-8')
             html = BeautifulSoup(data, features='html.parser')
             ip_list_soup = html.find(id='ip_list')
             for ip in ip_list_soup.find_all('tr'):
                 tds = ip.find_all('td')
-                if len(tds) > 0:
+                if len(tds) > 0 and tds[5].text == 'HTTPS':
                     ip_list.append(tds[1].text + ':' + tds[2].text)
-            time.sleep(0.2)
+            time.sleep(0.5)
         print('ip_list length: %d' % (len(ip_list)))
         return ip_list
     except Exception, e:
@@ -208,6 +224,8 @@ def transferOpener(ip_list):
     }
     raw_opener = urllib2.build_opener()
     raw_opener.addheaders = [('User-agent', headers['User-Agent']), ('Content-Type', headers['Content-Type'])]
+    # double local requester
+    #openers.append(raw_opener)
     openers.append(raw_opener)
     for ip_proxy in ip_list:
         proxies = {'http': ip_proxy, 'https': ip_proxy}  
@@ -220,13 +238,13 @@ def transferOpener(ip_list):
     
 def validData(data):
     try:
-        data = json.loads(data.read())
+        data = json.loads(data)
         if data['status'] == 'success': return data['result']
         return None
     except:
         return None
         
-def getValidProxyOpener(ip_list, valid_url, to_file='valid_proxy_list.pkl'):
+def getValidProxyOpener(ip_list, valid_url, to_file='cache/valid_proxy_list.pkl'):
     if os.path.exists(to_file):
         with open(to_file, 'rb') as fp:
             valid_openers = transferOpener(pickle.load(fp))
@@ -239,7 +257,7 @@ def getValidProxyOpener(ip_list, valid_url, to_file='valid_proxy_list.pkl'):
     max_opener_num = 50
     for i in range(opener_len//max_opener_num + 1):
         batch_openers = openers[i*max_opener_num:(i+1)*max_opener_num]
-        gs = [gevent.spawn(request, valid_url, [opener], None, 3, 1) for opener in batch_openers]
+        gs = [gevent.spawn(request, valid_url, [opener], None, 1.5, 1) for opener in batch_openers]
         res = gevent.joinall(gs)
         for j in range(len(gs)):
             d = gs[j].get()
@@ -251,68 +269,134 @@ def getValidProxyOpener(ip_list, valid_url, to_file='valid_proxy_list.pkl'):
     print('valid openers num: %d' % len(valid_openers))
     return valid_openers
 
-def getEntireCounty(counties, search_time='2018-12-01 00:00:00', to_file='entire_address.csv'):
+def getEntireCounty(counties, search_time='2018-12-08 00:00:00', to_file='cache/entire_address.csv'):
     if os.path.exists(to_file):
         county_df = pd.read_csv(to_file, encoding='utf-8')
         print('df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
         return county_df
     entire_counties = ['%s-%s-%s'%(county['provinceName'], county['cityName'], county['countyName']) for county in counties]
+    province = ['%s'%(county['provinceName']) for county in counties]
+    city = ['%s'%(county['cityName']) for county in counties]
     county_df = pd.DataFrame({'fromAddr': entire_counties})
-    county_df.loc[:,'done'] = 0
-    county_df = pd.merge(county_df, county_df, on='done', how='left')
+    county_df.loc[:,'province'] = province
+    county_df.loc[:,'city'] = city
+    county_df.loc[:,'temp'] = 0
+    cols = [col for col in county_df.columns if col not in ['province','city']]
+    county_df2 = county_df[cols]
+    county_df2.columns = ['toAddr', 'temp']
+    county_df = pd.merge(county_df, county_df2, on='temp', how='left')
+    del county_df['temp']
     print(county_df.columns)
-    county_df.columns = ['fromAddr','done','toAddr']
+    #county_df.columns = ['fromAddr','province','city','toAddr']
     county_df.loc[:,'time'] = search_time
+    #county_df.drop_duplicates(['fromAddr','toAddr'], inplace=True) # does not work
+    print('Origin df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
+    county_df = county_df[county_df.fromAddr!=county_df.toAddr]
     print(county_df.columns)
     print('df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
-    county_df.drop_duplicates(['fromAddr','toAddr'], inplace=True) # does not work
-    county_df.to_csv(to_file, index=None ,encoding='utf-8')
+    county_df.to_csv(to_file, index=None, encoding='utf-8')
     return county_df
     
-def geventReqByData(openers, url, datas=None):
-    lists = []
-    reget_list = []
-    print(datas[0])
-    gs = [gevent.spawn(request, url, openers, urllib.urlencode(data), 3, 1) for data in datas]
-    res = gevent.joinall(gs)
+def geventReqByData(queue, task_queue, openers, url, datas=None):
+    ds = [{
+        'departureCity': d[0].encode('utf8'), 
+        'destinationCity': d[1].encode('utf8'), 
+        'sendTime': d[2].encode('utf8')
+    } for d in datas]
+    
+    s_t = time.time()
+    MUTEX.acquire()
+    gs = [gevent.spawn(request, url, openers, json.dumps(data), 2, 1) for data in ds]
+    res = gevent.joinall(gs, timeout=2)
+    MUTEX.release()
+    
+    print('length of request: %d, gevent cost: %.2fs' % (len(gs), time.time() - s_t))
     for j in range(len(gs)):
         d = gs[j].get()
-        if d != None and d.msg == 'OK':
-            data = d.read()
-            print(data)
-            lists.extend(json.loads(data)['result'])
+        fdata = validData(d)
+        if fdata is None:
+            task_queue.put(datas[j])
         else:
-            reget_list.append(datas[j])
-    return lists, reget_list
+            #print(datas[j])
+            #fdata['check_route'] = '%s - %s' % (datas[j][0], datas[j][1])
+            fdata['fromAddr'] = datas[j][0]
+            fdata['toAddr'] = datas[j][1]
+            queue.put(fdata)
     
-def getNewPrice(openers, county_df, search_q, max_num=50, to_file='price.pkl'):
-    record_file = 'mark.csv'
-    if os.path.exists(record_file):
-        mark = pd.read_csv(record_file)
-    else:
-        mark = county_df[['done']]
-        mark.to_csv(record_file, index=None)
-        #county_df.loc[:,'done'] = mark.done
-    #try:
-    while len(mark[mark.done<1]) > 0:
-        s_t = time.time()
-        head_index = mark[mark.done<1].head(max_num).index
-        data = county_df.loc[head_index, ['fromAddr','toAddr','time']].values
-        data = [{'departureCity': d[0].encode('gbk'), 'destinationCity': d[1].encode('gbk'), 'sendTime': d[2].encode('gbk')} \
-                for d in data]
-        res, reget_list = geventReqByData(openers, search_q, data)
-        mark.loc[head_index, 'done'] = 1
-        print('result: %d vs %d, cost: %.4fs' % (len(res), len(reget_list), time.time()-s_t))
-    #except Exception, e:
-    #    print('getNewPrice Exception: %s' % str(e))
+def getNewPrice(openers, county_df, search_q, max_num=50, thread_num=8, file_path='data/'):
+    #record_file = 'cache/mark.csv'
+    #if os.path.exists(record_file):
+    #    mark = pd.read_csv(record_file)
+    #else:
+    #    mark = county_df[['done']]
     #    mark.to_csv(record_file, index=None)
+    #    #county_df.loc[:,'done'] = mark.done
+    try:
+        queue = Queue.Queue()
+        task_queue = Queue.Queue()
+        clip_size = max_num / thread_num
+        for gpn, gp in county_df.groupby('province'):
+            prov_dir = os.path.join(file_path,gpn)
+            if not os.path.exists(prov_dir): os.mkdir(prov_dir)
+            for gcn, gc in gp.groupby('city'):
+                s_t = time.time()
+                result = []
+                to_file = os.path.join(prov_dir, '%s.pkl'%(gcn))
+                if os.path.exists(to_file): continue
+                print('[-] Crawling %s-%s with length %d...' % (gpn, gcn, len(gc)))
+                data = gc[['fromAddr','toAddr','time']].values
+                for i in range(len(data)): task_queue.put(data[i])
+                num = 0
+                while not task_queue.empty():
+                    s_t2 = time.time()
+                    threads = []
+                    for tid in range(thread_num):
+                        d_batch = []
+                        for _ in range(max_num): 
+                            if not task_queue.empty(): d_batch.append(task_queue.get())
+                        if len(d_batch) == 0:
+                            break
+                        elif len(d_batch) < 10:
+                            thread = Thread(target=geventReqByData, args=(queue, task_queue, [openers[0]], search_q, d_batch, ))
+                            threads.append(thread)
+                            break
+                        else:
+                            thread = Thread(target=geventReqByData, args=(queue, task_queue, openers, search_q, d_batch, ))
+                            threads.append(thread)
+                    #print('q size %d'%task_queue.qsize())
+                    for thread in threads:
+                        thread.setDaemon(True)
+                        thread.start()
+                    for thread in threads:
+                        thread.join()
+                    #print('q size %d'%task_queue.qsize())
+                    count = 0
+                    while not queue.empty():
+                        result.append(queue.get())
+                        count += 1
+                    num += count
+                    dur2 = time.time() - s_t2
+                    total_num = float(thread_num * max_num)
+                    print('[%6d/%6d] time: %.4fs, process rate: %.2f/s, true rate: %.2f/s, success rate: %.3f' %\
+                          (num, len(gc), dur2, total_num / dur2, count / dur2, count / total_num))
+                dur = time.time() - s_t
+                print('[*] %s-%s with length %d cost %.2fs, process rate: %.3f/s' % (gpn, gcn, len(gc), dur, len(gc) / dur))
+                with open(to_file, 'wb') as fp: pickle.dump(result, fp)
+            print('[**] Province %s Done!' % (gpn))
+    #except KeyboardInterrupt:
+    #    save = raw_input('Save %s and %s? [y/n]' % (record_file, to_file))
+    #    if save == 'y':
+    #        mark.to_csv(record_file, index=None)
+    except Exception, e:
+        print('getNewPrice Exception: %s' % str(e))
+        #mark.to_csv(record_file, index=None)
 
 if __name__ == '__main__':
 
     #nation_path = 'nations.pkl'
     #province_path = 'provinces.pkl'
     
-    proxy_url = 'http://www.xicidaili.com/nn/'
+    proxy_url = 'http://www.xicidaili.com/wn/'
     base_url = 'https://www.deppon.com/'
     search_q = 'phonerest/pricetime/searchNewPrice'
     nation_q = 'phonerest/citycontrol/queryNations'
@@ -323,17 +407,22 @@ if __name__ == '__main__':
     main_lane_code = '100000'
     
     s_t = time.time()
-    ip_list = getProxy(proxy_url)
+    ip_list = getProxy(proxy_url, num=5)
     valid_openers = getValidProxyOpener(ip_list, os.path.join(base_url, nation_q))
     
-    nations = getNation([valid_openers[0]], os.path.join(base_url, nation_q))
-    nations_code = [nation['nationCode'] for nation in nations]
+    # exclude the national express route
+    #nations = getNation([valid_openers[0]], os.path.join(base_url, nation_q))
+    #nations_code = [nation['nationCode'] for nation in nations]
+    nations_code = []
     nations_code.append(main_lane_code)
     
     provinces = getProvince(valid_openers, nations_code, os.path.join(base_url, province_q), max_num=50)
-    hmt = getHMT([valid_openers[0]], os.path.join(base_url, hmt_q))
     provinces_code = [province['provinceCode'] for province in provinces]
-    provinces_code.extend([province['provinceCode'] for province in hmt])
+    hmt = getHMT([valid_openers[0]], os.path.join(base_url, hmt_q))
+    ig_code = [province['provinceCode'] for province in hmt]
+    print('Raw Provinces_code length: %d' % len(provinces_code))
+    provinces_code = [code for code in provinces_code if code not in ig_code]
+    print('Reduced HMT Provinces_code length: %d' % len(provinces_code))
     
     cities = getCity(valid_openers, provinces_code, os.path.join(base_url, city_q), max_num=50)
     cities_code = [city['cityCode'] for city in cities]
@@ -341,7 +430,7 @@ if __name__ == '__main__':
     counties = getCounty(valid_openers, cities_code, os.path.join(base_url, county_q), max_num=100)
     #counties_name = [county['countyName'] for county in counties]
     #print(','.join(counties_name))
-    county_df = getEntireCounty(counties, '2018-12-01 00:00:00')
+    county_df = getEntireCounty(counties, '2018-12-08 00:00:00')
     print('Ready data cost: %.4fs' % (time.time() - s_t))
+    getNewPrice(valid_openers, county_df, os.path.join(base_url, search_q), max_num=300, thread_num=8)
     
-    getNewPrice(valid_openers, county_df, os.path.join(base_url, search_q), max_num=10)
