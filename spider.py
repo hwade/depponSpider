@@ -110,7 +110,7 @@ def getHMT(openers, hmt_url, data=None, to_file='cache/hmt.pkl'):
                 return data
         res = request(hmt_url, openers=openers, data=data)
         #print(data)
-        while res is None or res.msg != 'OK':
+        while res is None:
             res = request(hmt_url, openers=openers, data=data)
         data = validData(res)
         #data = [d['nationCode'] for d in data]
@@ -257,7 +257,7 @@ def getValidProxyOpener(ip_list, valid_url, to_file='cache/valid_proxy_list.pkl'
     max_opener_num = 50
     for i in range(opener_len//max_opener_num + 1):
         batch_openers = openers[i*max_opener_num:(i+1)*max_opener_num]
-        gs = [gevent.spawn(request, valid_url, [opener], None, 1.5, 1) for opener in batch_openers]
+        gs = [gevent.spawn(request, valid_url, [opener], None, 2, 1) for opener in batch_openers]
         res = gevent.joinall(gs)
         for j in range(len(gs)):
             d = gs[j].get()
@@ -294,6 +294,47 @@ def getEntireCounty(counties, search_time='2018-12-08 00:00:00', to_file='cache/
     county_df = county_df[county_df.fromAddr!=county_df.toAddr]
     print(county_df.columns)
     print('df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
+    county_df.to_csv(to_file, index=None, encoding='utf-8')
+    return county_df
+    
+def getEntireCountyByMix(counties1, counties2, search_time='2018-12-08 00:00:00', to_file='cache/entire_address.csv'):
+    if os.path.exists(to_file):
+        county_df = pd.read_csv(to_file, encoding='utf-8')
+        print('df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
+        return county_df
+    
+    entire_counties1 = ['%s-%s-%s'%(county['provinceName'], county['cityName'], county['countyName']) for county in counties1]
+    entire_counties2 = ['%s-%s-%s'%(county['provinceName'], county['cityName'], county['countyName']) for county in counties2]
+    province1 = ['%s'%(county['provinceName']) for county in counties1]
+    province2 = ['%s'%(county['provinceName']) for county in counties2]
+    city1 = ['%s'%(county['cityName']) for county in counties1]
+    city2 = ['%s'%(county['cityName']) for county in counties2]
+    county_df1 = pd.DataFrame({'fromAddr': entire_counties1})
+    county_df2 = pd.DataFrame({'toAddr': entire_counties2})
+    county_df1.loc[:,'province'] = province1
+    county_df2.loc[:,'province'] = province2
+    county_df1.loc[:,'city'] = city1
+    county_df2.loc[:,'city'] = city2
+    county_df1.loc[:,'temp'] = 0
+    county_df2.loc[:,'temp'] = 0
+    
+    cols1 = [col for col in county_df1.columns if col not in ['province','city']]
+    cols2 = [col for col in county_df2.columns if col not in ['province','city']]
+    
+    county_df_new1 = pd.merge(county_df1[cols1], county_df2, on='temp', how='left')
+    county_df_new2 = pd.merge(county_df1, county_df2[cols2], on='temp', how='left')
+    del county_df_new1['temp'], county_df_new2['temp']
+    
+    print(county_df_new1.columns, county_df_new2.columns)
+    county_df_new2.rename(index=str, columns={'fromAddr': 'toAddr', 'toAddr': 'fromAddr'})
+    
+    county_df = pd.concat([county_df_new1, county_df_new2], axis=0)
+    county_df.loc[:,'time'] = search_time
+    
+    print('Origin df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
+    county_df = county_df[county_df.fromAddr!=county_df.toAddr]
+    print('df_county shape: (%d, %d)' % (county_df.shape[0], county_df.shape[1]))
+    print(county_df.columns)
     county_df.to_csv(to_file, index=None, encoding='utf-8')
     return county_df
     
@@ -350,13 +391,15 @@ def getNewPrice(openers, county_df, search_q, max_num=50, thread_num=8, file_pat
                 while not task_queue.empty():
                     s_t2 = time.time()
                     threads = []
+                    total_num = 0
                     for tid in range(thread_num):
                         d_batch = []
                         for _ in range(max_num): 
                             if not task_queue.empty(): d_batch.append(task_queue.get())
+                        total_num += len(d_batch)
                         if len(d_batch) == 0:
                             break
-                        elif len(d_batch) < 10:
+                        elif len(d_batch) < 5:
                             thread = Thread(target=geventReqByData, args=(queue, task_queue, [openers[0]], search_q, d_batch, ))
                             threads.append(thread)
                             break
@@ -376,7 +419,8 @@ def getNewPrice(openers, county_df, search_q, max_num=50, thread_num=8, file_pat
                         count += 1
                     num += count
                     dur2 = time.time() - s_t2
-                    total_num = float(thread_num * max_num)
+                    #total_num = float(thread_num * max_num)
+                    total_num = float(total_num)
                     print('[%6d/%6d] time: %.4fs, process rate: %.2f/s, true rate: %.2f/s, success rate: %.3f' %\
                           (num, len(gc), dur2, total_num / dur2, count / dur2, count / total_num))
                 dur = time.time() - s_t
@@ -407,7 +451,7 @@ if __name__ == '__main__':
     main_lane_code = '100000'
     
     s_t = time.time()
-    ip_list = getProxy(proxy_url, num=5)
+    ip_list = getProxy(proxy_url, num=1)
     valid_openers = getValidProxyOpener(ip_list, os.path.join(base_url, nation_q))
     
     # exclude the national express route
@@ -419,18 +463,34 @@ if __name__ == '__main__':
     provinces = getProvince(valid_openers, nations_code, os.path.join(base_url, province_q), max_num=50)
     provinces_code = [province['provinceCode'] for province in provinces]
     hmt = getHMT([valid_openers[0]], os.path.join(base_url, hmt_q))
+    
     ig_code = [province['provinceCode'] for province in hmt]
     print('Raw Provinces_code length: %d' % len(provinces_code))
     provinces_code = [code for code in provinces_code if code not in ig_code]
     print('Reduced HMT Provinces_code length: %d' % len(provinces_code))
     
-    cities = getCity(valid_openers, provinces_code, os.path.join(base_url, city_q), max_num=50)
-    cities_code = [city['cityCode'] for city in cities]
+    # ------ MainLand -------
+    mainland_cities = getCity(valid_openers, provinces_code, os.path.join(base_url, city_q), max_num=50, to_file='cache/mainland_city.pkl')
+    mainland_cities_code = [city['cityCode'] for city in mainland_cities]
+    mainland_counties = getCounty(valid_openers, mainland_cities_code, os.path.join(base_url, county_q), max_num=100, 
+                                  to_file='cache/mainland_county.pkl')
     
-    counties = getCounty(valid_openers, cities_code, os.path.join(base_url, county_q), max_num=100)
+    # ------    HMT   -------
+    # HMT provinces, HongKong and Macow, TaiWan - 710000
+    print(hmt)
+    HMT_provinces_code = [province['provinceCode'] for province in hmt if province['provinceCode'] != u'710000']
+    print(HMT_provinces_code)
+    
+    HMT_cities = getCity(valid_openers, HMT_provinces_code, os.path.join(base_url, city_q), max_num=50, to_file='cache/HMT_city.pkl')
+    HMT_cities_code = [city['cityCode'] for city in HMT_cities]
+    HMT_counties = getCounty(valid_openers, HMT_cities_code, os.path.join(base_url, county_q), max_num=100, to_file='cache/HMT_county.pkl')
+    
+    # ------ Merge Mix Counties ------
+    all_counties = getEntireCountyByMix(mainland_counties, HMT_counties, '2018-12-08 00:00:00')
+    
     #counties_name = [county['countyName'] for county in counties]
     #print(','.join(counties_name))
-    county_df = getEntireCounty(counties, '2018-12-08 00:00:00')
+    #county_df = getEntireCounty(counties, '2018-12-08 00:00:00')
     print('Ready data cost: %.4fs' % (time.time() - s_t))
-    getNewPrice(valid_openers, county_df, os.path.join(base_url, search_q), max_num=300, thread_num=8)
+    getNewPrice(valid_openers, all_counties, os.path.join(base_url, search_q), max_num=50, thread_num=4)
     
