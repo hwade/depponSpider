@@ -159,7 +159,7 @@ def getCity(openers, provinces_code, city_url, max_num=50, to_file='cache/city.p
             cities.extend(geventReqRecurve(openers, url_batch))
             i = i + 1
         with open(to_file, 'wb') as fp: pickle.dump(cities, fp)
-        print('Cities length: %d' % len(cities))
+        #print('Cities length: %d' % len(cities))
         return cities
     except Exception, e:
         print('GetCities Exception: %s' % str(e))
@@ -170,7 +170,7 @@ def getCounty(openers, cities_code, county_url, max_num=50, to_file='cache/count
         if os.path.exists(to_file): 
             with open(to_file, 'rb') as fp: 
                 counties = pickle.load(fp)
-                print('Counties length: %d' % len(counties))
+                #print('Counties length: %d' % len(counties))
                 return counties
         
         i = 0
@@ -189,7 +189,7 @@ def getCounty(openers, cities_code, county_url, max_num=50, to_file='cache/count
             counties.extend(geventReqRecurve(openers, url_batch))
             
         with open(to_file, 'wb') as fp: pickle.dump(counties, fp)
-        print('Counties length: %d' % len(counties))
+        #print('Counties length: %d' % len(counties))
         return counties
     except Exception, e:
         print('GetCounties Exception: %s' % str(e))
@@ -254,10 +254,10 @@ def getValidProxyOpener(ip_list, valid_url, to_file='cache/valid_proxy_list.pkl'
     valid_proxy = []
     openers = transferOpener(ip_list)
     opener_len = len(openers)
-    max_opener_num = 50
+    max_opener_num = 100
     for i in range(opener_len//max_opener_num + 1):
         batch_openers = openers[i*max_opener_num:(i+1)*max_opener_num]
-        gs = [gevent.spawn(request, valid_url, [opener], None, 2, 1) for opener in batch_openers]
+        gs = [gevent.spawn(request, valid_url, [opener], None, 1.5, 1) for opener in batch_openers]
         res = gevent.joinall(gs)
         for j in range(len(gs)):
             d = gs[j].get()
@@ -326,7 +326,7 @@ def getEntireCountyByMix(counties1, counties2, search_time='2018-12-08 00:00:00'
     del county_df_new1['temp'], county_df_new2['temp']
     
     print(county_df_new1.columns, county_df_new2.columns)
-    county_df_new2.rename(index=str, columns={'fromAddr': 'toAddr', 'toAddr': 'fromAddr'})
+    county_df_new1.rename(index=str, columns={'fromAddr': 'toAddr', 'toAddr': 'fromAddr'}, inplace=True)
     
     county_df = pd.concat([county_df_new1, county_df_new2], axis=0)
     county_df.loc[:,'time'] = search_time
@@ -345,10 +345,12 @@ def geventReqByData(queue, task_queue, openers, url, datas=None):
         'sendTime': d[2].encode('utf8')
     } for d in datas]
     
+    timeout = 2.0
+    
     s_t = time.time()
     MUTEX.acquire()
-    gs = [gevent.spawn(request, url, openers, json.dumps(data), 2, 1) for data in ds]
-    res = gevent.joinall(gs, timeout=2)
+    gs = [gevent.spawn(request, url, openers, json.dumps(data), timeout, 1) for data in ds]
+    res = gevent.joinall(gs, timeout=timeout)
     MUTEX.release()
     
     print('length of request: %d, gevent cost: %.2fs' % (len(gs), time.time() - s_t))
@@ -376,8 +378,12 @@ def getNewPrice(openers, county_df, search_q, max_num=50, thread_num=8, file_pat
         queue = Queue.Queue()
         task_queue = Queue.Queue()
         clip_size = max_num / thread_num
+        
+        if not os.path.exists(file_path):
+            os.mkdir(file_path)
+            
         for gpn, gp in county_df.groupby('province'):
-            prov_dir = os.path.join(file_path,gpn)
+            prov_dir = os.path.join(file_path, gpn)
             if not os.path.exists(prov_dir): os.mkdir(prov_dir)
             for gcn, gc in gp.groupby('city'):
                 s_t = time.time()
@@ -388,44 +394,48 @@ def getNewPrice(openers, county_df, search_q, max_num=50, thread_num=8, file_pat
                 data = gc[['fromAddr','toAddr','time']].values
                 for i in range(len(data)): task_queue.put(data[i])
                 num = 0
-                while not task_queue.empty():
-                    s_t2 = time.time()
-                    threads = []
-                    total_num = 0
-                    for tid in range(thread_num):
-                        d_batch = []
-                        for _ in range(max_num): 
-                            if not task_queue.empty(): d_batch.append(task_queue.get())
-                        total_num += len(d_batch)
-                        if len(d_batch) == 0:
-                            break
-                        elif len(d_batch) < 5:
-                            thread = Thread(target=geventReqByData, args=(queue, task_queue, [openers[0]], search_q, d_batch, ))
-                            threads.append(thread)
-                            break
-                        else:
-                            thread = Thread(target=geventReqByData, args=(queue, task_queue, openers, search_q, d_batch, ))
-                            threads.append(thread)
-                    #print('q size %d'%task_queue.qsize())
-                    for thread in threads:
-                        thread.setDaemon(True)
-                        thread.start()
-                    for thread in threads:
-                        thread.join()
-                    #print('q size %d'%task_queue.qsize())
-                    count = 0
-                    while not queue.empty():
-                        result.append(queue.get())
-                        count += 1
-                    num += count
-                    dur2 = time.time() - s_t2
-                    #total_num = float(thread_num * max_num)
-                    total_num = float(total_num)
-                    print('[%6d/%6d] time: %.4fs, process rate: %.2f/s, true rate: %.2f/s, success rate: %.3f' %\
-                          (num, len(gc), dur2, total_num / dur2, count / dur2, count / total_num))
+                with open(to_file, 'wb') as fp:
+                    while not task_queue.empty():
+                        s_t2 = time.time()
+                        threads = []
+                        total_num = 0
+                        result = []
+                        for tid in range(thread_num):
+                            d_batch = []
+                            for _ in range(max_num): 
+                                if not task_queue.empty(): d_batch.append(task_queue.get())
+                            total_num += len(d_batch)
+                            if len(d_batch) == 0:
+                                break
+                            elif len(d_batch) < 5:
+                                thread = Thread(target=geventReqByData, args=(queue, task_queue, [openers[0]], search_q, d_batch, ))
+                                threads.append(thread)
+                                break
+                            else:
+                                thread = Thread(target=geventReqByData, args=(queue, task_queue, openers, search_q, d_batch, ))
+                                threads.append(thread)
+                        #print('q size %d'%task_queue.qsize())
+                        for thread in threads:
+                            thread.setDaemon(True)
+                            thread.start()
+                        for thread in threads:
+                            thread.join()
+                        #print('q size %d'%task_queue.qsize())
+                        count = 0
+                        while not queue.empty():
+                            result.append(queue.get())
+                            count += 1
+                        num += count
+                        dur2 = time.time() - s_t2
+                        #total_num = float(thread_num * max_num)
+                        total_num = float(total_num)
+                        print('[%6d/%6d] time: %.4fs, process rate: %.2f/s, true rate: %.2f/s, success rate: %.3f' %\
+                              (num, len(gc), dur2, total_num / dur2, count / dur2, count / total_num))
+                         
+                        pickle.dump(result, fp)
                 dur = time.time() - s_t
                 print('[*] %s-%s with length %d cost %.2fs, process rate: %.3f/s' % (gpn, gcn, len(gc), dur, len(gc) / dur))
-                with open(to_file, 'wb') as fp: pickle.dump(result, fp)
+                
             print('[**] Province %s Done!' % (gpn))
     #except KeyboardInterrupt:
     #    save = raw_input('Save %s and %s? [y/n]' % (record_file, to_file))
@@ -451,7 +461,7 @@ if __name__ == '__main__':
     main_lane_code = '100000'
     
     s_t = time.time()
-    ip_list = getProxy(proxy_url, num=1)
+    ip_list = getProxy(proxy_url, num=8)
     valid_openers = getValidProxyOpener(ip_list, os.path.join(base_url, nation_q))
     
     # exclude the national express route
@@ -471,26 +481,32 @@ if __name__ == '__main__':
     
     # ------ MainLand -------
     mainland_cities = getCity(valid_openers, provinces_code, os.path.join(base_url, city_q), max_num=50, to_file='cache/mainland_city.pkl')
+    print('Mainland City length: %d' % len(mainland_cities))
     mainland_cities_code = [city['cityCode'] for city in mainland_cities]
     mainland_counties = getCounty(valid_openers, mainland_cities_code, os.path.join(base_url, county_q), max_num=100, 
                                   to_file='cache/mainland_county.pkl')
+    print('Mainland Counties length: %d' % len(mainland_counties))
     
     # ------    HMT   -------
     # HMT provinces, HongKong and Macow, TaiWan - 710000
     print(hmt)
-    HMT_provinces_code = [province['provinceCode'] for province in hmt if province['provinceCode'] != u'710000']
+    HMT_provinces_code = [province['provinceCode'] for province in hmt]
     print(HMT_provinces_code)
     
     HMT_cities = getCity(valid_openers, HMT_provinces_code, os.path.join(base_url, city_q), max_num=50, to_file='cache/HMT_city.pkl')
+    print('HMT City length: %d' % len(HMT_cities))
     HMT_cities_code = [city['cityCode'] for city in HMT_cities]
     HMT_counties = getCounty(valid_openers, HMT_cities_code, os.path.join(base_url, county_q), max_num=100, to_file='cache/HMT_county.pkl')
+    print('HMT Counties length: %d' % len(HMT_counties))
     
     # ------ Merge Mix Counties ------
-    all_counties = getEntireCountyByMix(mainland_counties, HMT_counties, '2018-12-08 00:00:00')
+    #all_counties = getEntireCountyByMix(mainland_counties, HMT_counties, '2018-12-08 00:00:00')
+    all_counties = getEntireCountyByMix(mainland_counties, mainland_counties, '2019-04-16 00:00:00')
+    print('all_counties pairs length: %d ' % len(all_counties))
     
     #counties_name = [county['countyName'] for county in counties]
     #print(','.join(counties_name))
     #county_df = getEntireCounty(counties, '2018-12-08 00:00:00')
     print('Ready data cost: %.4fs' % (time.time() - s_t))
-    getNewPrice(valid_openers, all_counties, os.path.join(base_url, search_q), max_num=50, thread_num=4)
+    getNewPrice(valid_openers, all_counties, os.path.join(base_url, search_q), max_num=250, thread_num=4)
     
